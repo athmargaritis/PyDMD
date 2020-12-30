@@ -12,7 +12,7 @@ import matplotlib as mpl
 import numpy as np
 from past.utils import old_div
 
-mpl.rcParams['figure.max_open_warning'] = 0
+mpl.rcParams["figure.max_open_warning"] = 0
 import matplotlib.pyplot as plt
 
 from .dmdoperator import DMDOperator
@@ -115,9 +115,11 @@ class DMDBase(object):
         :return: the time intervals of the original snapshots.
         :rtype: numpy.ndarray
         """
-        return np.arange(self.dmd_time['t0'],
-                         self.dmd_time['tend'] + self.dmd_time['dt'],
-                         self.dmd_time['dt'])
+        return np.arange(
+            self.dmd_time["t0"],
+            self.dmd_time["tend"] + self.dmd_time["dt"],
+            self.dmd_time["dt"],
+        )
 
     @property
     def original_timesteps(self):
@@ -127,9 +129,11 @@ class DMDBase(object):
         :return: the time intervals of the original snapshots.
         :rtype: numpy.ndarray
         """
-        return np.arange(self.original_time['t0'],
-                         self.original_time['tend'] + self.original_time['dt'],
-                         self.original_time['dt'])
+        return np.arange(
+            self.original_time["t0"],
+            self.original_time["tend"] + self.original_time["dt"],
+            self.original_time["dt"],
+        )
 
     @property
     def modes(self):
@@ -251,7 +255,7 @@ class DMDBase(object):
         :return: the array that contains the frequencies of the eigenvalues.
         :rtype: numpy.ndarray
         """
-        return np.log(self.eigs).imag / (2 * np.pi * self.original_time['dt'])
+        return np.log(self.eigs).imag / (2 * np.pi * self.original_time["dt"])
 
     @property
     def amplitudes(self):
@@ -272,8 +276,10 @@ class DMDBase(object):
         Not implemented, it has to be implemented in subclasses.
         """
         raise NotImplementedError(
-            'Subclass must implement abstract method {}.fit'.format(
-                self.__class__.__name__))
+            "Subclass must implement abstract method {}.fit".format(
+                self.__class__.__name__
+            )
+        )
 
     @staticmethod
     def _col_major_2darray(X):
@@ -297,7 +303,7 @@ class DMDBase(object):
             input_shapes = [np.asarray(x).shape for x in X]
 
             if len(set(input_shapes)) != 1:
-                raise ValueError('Snapshots have not the same dimension.')
+                raise ValueError("Snapshots have not the same dimension.")
 
             snapshots_shape = input_shapes[0]
             snapshots = np.transpose([np.asarray(x).flatten() for x in X])
@@ -346,6 +352,10 @@ class DMDBase(object):
             tmp = np.linalg.multi_dot([U, np.diag(s), V]).conj().T
             q = np.conj(np.diag(np.linalg.multi_dot([vander, tmp, self.modes])))
 
+            self._P = P
+            self._q = q
+            self._sscalar = np.trace(tmp @ tmp.conj().T)
+
             # b optimal
             a = np.linalg.solve(P, q)
         else:
@@ -360,11 +370,116 @@ class DMDBase(object):
 
         return a
 
-    def plot_eigs(self,
-                  show_axes=True,
-                  show_unit_circle=True,
-                  figsize=(8, 8),
-                  title=''):
+    def computeDMDSP(self, gammaval=None, options=None):
+        import numpy.linalg as la
+
+        if options is None:
+            options = {"rho": 1.0, "maxiter": 10000, "eps_abs": 1e-6, "eps_rel": 1e-4}
+
+        P = self._P
+        q = self._q
+        s = self._sscalar
+
+        # Data preprocessing
+        rho = options["rho"]
+        Max_ADMM_Iter = options["maxiter"]
+        eps_abs = options["eps_abs"]
+        eps_rel = options["eps_rel"]
+
+        # Number of optimization variables
+        n = q.size
+        ng = gammaval.size
+
+        # Identity matrix
+        I = np.eye(n)
+
+        # Allocate memory for gamma-dependent output variables
+        gammas = np.copy(gammaval)
+        Nz = np.zeros(ng)
+        Jsp = np.zeros(ng)
+        Jpol = np.zeros(ng)
+        Ploss = np.zeros(ng)
+        xsp = np.zeros((ng, n))
+        xpol = np.zeros((ng, n))
+
+        # Cholesky factorization of matrix P + (rho/2)*I
+        Prho = P + (rho / 2) * I
+        Plow = la.cholesky(Prho)
+        Plow_star = Plow.conj().T
+
+        for i in range(ng):
+
+            gamma = gammas[i]
+            y = np.zeros(n)
+            z = np.zeros(n)
+
+            a = (gamma / rho) * np.ones(n)
+
+            for ADMMstep in range(Max_ADMM_Iter):
+
+                u = z - (1 / rho) * y
+
+                xnew = la.solve(Plow_star, la.solve(Plow, (q + (rho / 2.0) * u)))
+
+                v = xnew + (1 / rho) * y
+
+                znew = (1 - a / np.abs(v)) * v
+                znew = znew * np.asarray(np.abs(v) > a)
+
+                res_prim = la.norm(xnew - znew)
+                res_dual = rho * la.norm(znew - z)
+
+                y = y + rho * (xnew - znew)
+
+                eps_prim = np.sqrt(n) * eps_abs + eps_rel * np.nanmax(
+                    [la.norm(xnew), la.norm(znew)]
+                )
+                eps_dual = np.sqrt(n) * eps_abs + eps_rel * la.norm(y)
+
+                z = np.copy(znew)
+                if (res_prim < eps_prim) and (res_dual < eps_dual):
+                    break
+
+            # Polishing of the nonzero amplitudes
+            # Form the constraint matrix E for E^T x = 0
+            ind_zero = np.array(np.where(np.abs(z) < 1.0e-12)).reshape((-1,))
+            m = len(ind_zero)
+            E = I[:, ind_zero]
+            # E = sparse(E)
+
+            KKT = np.vstack(
+                (np.hstack((P, E)), np.hstack((E.conj().T, np.zeros((m, m)))))
+            )
+            rhs = np.hstack((q, np.zeros(m)))
+            sol = la.solve(KKT, rhs)
+            sol = sol[:n]
+
+            # Record output data
+            xsp[i, :] = np.abs(z)
+            Nz[i] = np.count_nonzero(z)
+            Jsp[i] = (z.conj().T @ P @ z).real - 2.0 * (q.conj().T @ z).real + s
+            xpol[i, :] = np.abs(sol)
+            Jpol[i] = (sol.conj().T @ P @ sol).real - 2.0 * (q.conj().T @ sol).real + s
+            Ploss[i] = 100 * np.sqrt(Jpol[i] / s)
+
+        self._DMDSP = {
+            "gammas": gammas,
+            "Nz": Nz,
+            "Jsp": Jsp,
+            "Jpol": Jpol,
+            "Ploss": Ploss,
+            "xsp": xsp,
+            "xpol": xpol,
+        }
+
+        return
+
+    def getDMDSP(self):
+        return self._DMDSP
+
+    def plot_eigs(
+        self, show_axes=True, show_unit_circle=True, figsize=(8, 8), title=""
+    ):
         """
         Plot the eigenvalues.
 
@@ -376,74 +491,74 @@ class DMDBase(object):
             size. Default is (8, 8).
         :param str title: title of the plot.
         """
-        if self.eigs is None:
-            raise ValueError('The eigenvalues have not been computed.'
-                             'You have to perform the fit method.')
+        if self._eigs is None:
+            raise ValueError(
+                "The eigenvalues have not been computed."
+                "You have to perform the fit method."
+            )
 
         plt.figure(figsize=figsize)
         plt.title(title)
         plt.gcf()
         ax = plt.gca()
 
-        points, = ax.plot(self.eigs.real,
-                          self.eigs.imag,
-                          'bo',
-                          label='Eigenvalues')
+        (points,) = ax.plot(self._eigs.real, self._eigs.imag, "bo", label="Eigenvalues")
 
         # set limits for axis
         limit = np.max(np.ceil(np.absolute(self.eigs)))
         ax.set_xlim((-limit, limit))
         ax.set_ylim((-limit, limit))
 
-        plt.ylabel('Imaginary part')
-        plt.xlabel('Real part')
+        plt.ylabel("Imaginary part")
+        plt.xlabel("Real part")
 
         if show_unit_circle:
-            unit_circle = plt.Circle((0., 0.),
-                                     1.,
-                                     color='green',
-                                     fill=False,
-                                     label='Unit circle',
-                                     linestyle='--')
+            unit_circle = plt.Circle(
+                (0.0, 0.0),
+                1.0,
+                color="green",
+                fill=False,
+                label="Unit circle",
+                linestyle="--",
+            )
             ax.add_artist(unit_circle)
 
         # Dashed grid
         gridlines = ax.get_xgridlines() + ax.get_ygridlines()
         for line in gridlines:
-            line.set_linestyle('-.')
+            line.set_linestyle("-.")
         ax.grid(True)
 
-        ax.set_aspect('equal')
+        ax.set_aspect("equal")
 
         # x and y axes
         if show_axes:
-            ax.annotate('',
-                        xy=(np.max([limit * 0.8, 1.]), 0.),
-                        xytext=(np.min([-limit * 0.8, -1.]), 0.),
-                        arrowprops=dict(arrowstyle="->"))
-            ax.annotate('',
-                        xy=(0., np.max([limit * 0.8, 1.])),
-                        xytext=(0., np.min([-limit * 0.8, -1.])),
-                        arrowprops=dict(arrowstyle="->"))
+            ax.annotate(
+                "",
+                xy=(np.max([limit * 0.8, 1.0]), 0.0),
+                xytext=(np.min([-limit * 0.8, -1.0]), 0.0),
+                arrowprops=dict(arrowstyle="->"),
+            )
+            ax.annotate(
+                "",
+                xy=(0.0, np.max([limit * 0.8, 1.0])),
+                xytext=(0.0, np.min([-limit * 0.8, -1.0])),
+                arrowprops=dict(arrowstyle="->"),
+            )
 
         # legend
         if show_unit_circle:
             ax.add_artist(
-                plt.legend([points, unit_circle],
-                           ['Eigenvalues', 'Unit circle'],
-                           loc=1))
+                plt.legend([points, unit_circle], ["Eigenvalues", "Unit circle"], loc=1)
+            )
         else:
-            ax.add_artist(plt.legend([points], ['Eigenvalues'], loc=1))
+            ax.add_artist(plt.legend([points], ["Eigenvalues"], loc=1))
 
         plt.show()
 
-    def plot_modes_2D(self,
-                      index_mode=None,
-                      filename=None,
-                      x=None,
-                      y=None,
-                      order='C',
-                      figsize=(8, 8)):
+    def plot_modes_2D(
+        self, index_mode=None, filename=None, x=None, y=None, order="C", figsize=(8, 8)
+    ):
         """
         Plot the DMD Modes.
 
@@ -469,18 +584,20 @@ class DMDBase(object):
         :param tuple(int,int) figsize: tuple in inches defining the figure
             size. Default is (8, 8).
         """
-        if self.modes is None:
-            raise ValueError('The modes have not been computed.'
-                             'You have to perform the fit method.')
+        if self._modes is None:
+            raise ValueError(
+                "The modes have not been computed."
+                "You have to perform the fit method."
+            )
 
         if x is None and y is None:
             if self._snapshots_shape is None:
                 raise ValueError(
-                    'No information about the original shape of the snapshots.')
+                    "No information about the original shape of the snapshots."
+                )
 
             if len(self._snapshots_shape) != 2:
-                raise ValueError(
-                    'The dimension of the input snapshots is not 2D.')
+                raise ValueError("The dimension of the input snapshots is not 2D.")
 
         # If domain dimensions have not been passed as argument,
         # use the snapshots dimensions
@@ -500,7 +617,7 @@ class DMDBase(object):
 
         for idx in index_mode:
             fig = plt.figure(figsize=figsize)
-            fig.suptitle('DMD Mode {}'.format(idx))
+            fig.suptitle("DMD Mode {}".format(idx))
 
             real_ax = fig.add_subplot(1, 2, 1)
             imag_ax = fig.add_subplot(1, 2, 2)
@@ -522,29 +639,25 @@ class DMDBase(object):
             fig.colorbar(real, ax=real_ax)
             fig.colorbar(imag, ax=imag_ax)
 
-            real_ax.set_aspect('auto')
-            imag_ax.set_aspect('auto')
+            real_ax.set_aspect("auto")
+            imag_ax.set_aspect("auto")
 
-            real_ax.set_title('Real')
-            imag_ax.set_title('Imag')
+            real_ax.set_title("Real")
+            imag_ax.set_title("Imag")
 
             # padding between elements
-            plt.tight_layout(pad=2.)
+            plt.tight_layout(pad=2.0)
 
             if filename:
-                plt.savefig('{0}.{1}{2}'.format(basename, idx, ext))
+                plt.savefig("{0}.{1}{2}".format(basename, idx, ext))
                 plt.close(fig)
 
         if not filename:
             plt.show()
 
-    def plot_snapshots_2D(self,
-                          index_snap=None,
-                          filename=None,
-                          x=None,
-                          y=None,
-                          order='C',
-                          figsize=(8, 8)):
+    def plot_snapshots_2D(
+        self, index_snap=None, filename=None, x=None, y=None, order="C", figsize=(8, 8)
+    ):
         """
         Plot the snapshots.
 
@@ -571,16 +684,16 @@ class DMDBase(object):
             size. Default is (8, 8).
         """
         if self._snapshots is None:
-            raise ValueError('Input snapshots not found.')
+            raise ValueError("Input snapshots not found.")
 
         if x is None and y is None:
             if self._snapshots_shape is None:
                 raise ValueError(
-                    'No information about the original shape of the snapshots.')
+                    "No information about the original shape of the snapshots."
+                )
 
             if len(self._snapshots_shape) != 2:
-                raise ValueError(
-                    'The dimension of the input snapshots is not 2D.')
+                raise ValueError("The dimension of the input snapshots is not 2D.")
 
         # If domain dimensions have not been passed as argument,
         # use the snapshots dimensions
@@ -600,7 +713,7 @@ class DMDBase(object):
 
         for idx in index_snap:
             fig = plt.figure(figsize=figsize)
-            fig.suptitle('Snapshot {}'.format(idx))
+            fig.suptitle("Snapshot {}".format(idx))
 
             snapshot = (self._snapshots.T[idx].real.reshape(xgrid.shape,
                                                             order=order))
@@ -614,7 +727,7 @@ class DMDBase(object):
             fig.colorbar(contour)
 
             if filename:
-                plt.savefig('{0}.{1}{2}'.format(basename, idx, ext))
+                plt.savefig("{0}.{1}{2}".format(basename, idx, ext))
                 plt.close(fig)
 
         if not filename:
